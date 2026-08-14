@@ -299,11 +299,12 @@ class Tion:
     async def _try_connect(self) -> bool:
         """Tries to connect with retries"""
         device = self._next_btle_device if self._next_btle_device is not None else self._ble_device
-        disconnected_callback = None
 
         def _on_disconnect(client: BleakClientWithServiceCache) -> None:
             if self._btle is client:
                 _LOGGER.debug("BLE device disconnected callback fired")
+                self.have_breezer_state = False
+                self._btle = None
 
         if isinstance(device, BLEDevice):
             self._btle = await establish_connection(

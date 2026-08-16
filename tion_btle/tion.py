@@ -8,9 +8,9 @@ from asyncio import Semaphore
 from typing import Callable, List, final
 from time import localtime, strftime
 
-from bleak import BleakClient
 from bleak import exc
 from bleak.backends.device import BLEDevice
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,8 +81,9 @@ class Tion:
 
     def __init__(self, mac: str | BLEDevice):
         self._mac = mac
-        self._btle: BleakClient = BleakClient(mac)
-        self._next_btle_device: BleakClient | None = None
+        self._ble_device: BLEDevice | str = mac
+        self._btle: BleakClientWithServiceCache | None = None
+        self._next_btle_device: BLEDevice | str | None = None
         self._delegation = TionDelegation()
         self._fan_speed = 0
         self._model: str = self.__class__.__name__
@@ -246,7 +247,12 @@ class Tion:
 
         try:
             await self.connect()
-            current_settings = await self.get(skip_update=True)
+            if not self.have_breezer_state:
+                await self._try_write(request=self.command_getStatus)
+                raw = await self._get_data_from_breezer()
+                self._decode_response(raw)
+            current_settings = self.__generate_common_json()
+            current_settings.update(self._generate_model_specific_json())
 
             merged_settings = {**current_settings, **new_settings}
 
@@ -285,15 +291,38 @@ class Tion:
     @final
     @property
     def connection_status(self):
-        status = "connected" if self._btle.is_connected else "disc"
+        status = "connected" if (self._btle is not None and self._btle.is_connected) else "disc"
         return status
 
     @final
     @retry(retries=1, delay=2)
     async def _try_connect(self) -> bool:
         """Tries to connect with retries"""
-        self.set_new_btle_device()
-        return await self._btle.connect()
+        device = self._next_btle_device if self._next_btle_device is not None else self._ble_device
+
+        def _on_disconnect(client: BleakClientWithServiceCache) -> None:
+            if self._btle is client:
+                _LOGGER.debug("BLE device disconnected callback fired")
+                self.have_breezer_state = False
+                self._btle = None
+
+        if isinstance(device, BLEDevice):
+            self._btle = await establish_connection(
+                BleakClientWithServiceCache,
+                device,
+                device.name or self.mac,
+                disconnected_callback=_on_disconnect,
+                use_services_cache=True,
+                ble_device_callback=lambda: self._ble_device
+                if isinstance(self._ble_device, BLEDevice) else None,
+            )
+        else:
+            # fallback for plain MAC string (no HA integration)
+            self._btle = BleakClientWithServiceCache(device, disconnected_callback=_on_disconnect)
+            await self._btle.connect()
+
+        self._next_btle_device = None
+        return self._btle.is_connected
 
     @final
     async def _connect(self, need_notifications: bool = True):
@@ -303,6 +332,13 @@ class Tion:
                 await self._try_connect()
             except exc.BleakError as e:
                 _LOGGER.warning(f"Got {str(e)=} exception in _connect")
+                # Ensure stale client is cleaned up on failure
+                if self._btle is not None:
+                    try:
+                        await self._btle.disconnect()
+                    except Exception:
+                        pass
+                    self._btle = None
                 raise e
 
             if need_notifications:
@@ -314,11 +350,9 @@ class Tion:
     @final
     async def _disconnect(self):
         _LOGGER.debug(f"Disconnecting. {self.connection_status=}.")
-        if self.connection_status != "disc":
+        if self.connection_status != "disc" and self._btle is not None:
             await self._btle.disconnect()
-            async with self._semaphore:
-                self.set_new_btle_device()
-
+        self._btle = None
         _LOGGER.debug(f"_disconnect done. {self.connection_status=}")
 
     @final
@@ -506,14 +540,20 @@ class Tion:
         if self.__connections_count == 0:
             self.have_breezer_state = False
             async with self._semaphore:
-                await self._connect()
+                try:
+                    await self._connect()
+                except Exception:
+                    # _connect failed; don't increment so count stays at 0
+                    raise
 
         self.__connections_count += 1
 
     @final
     async def disconnect(self):
-        self.__connections_count -= 1
+        if self.__connections_count > 0:
+            self.__connections_count -= 1
         if self.__connections_count <= 0:
+            self.__connections_count = 0
             await self._disconnect()
             self.have_breezer_state = False
             while self._delegation.haveNewData:
@@ -556,7 +596,7 @@ class Tion:
                     break
                 i = 0
             else:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
             i += 1
         else:
             _LOGGER.debug("Waiting too long for data")
@@ -574,15 +614,10 @@ class Tion:
         if new_device is None:
             _LOGGER.info(f"Skipping update due to {new_device= }!")
             return
+        self._ble_device = new_device
         self._next_btle_device = new_device
 
     @final
     def set_new_btle_device(self):
-        if self._next_btle_device is not None:
-            try:
-                _LOGGER.debug(f"Updating _btle instance from {self._btle} to {self._next_btle_device}")
-            except AttributeError:
-                pass
-
-            self._btle = BleakClient(self._next_btle_device)
-            self._next_btle_device = None
+        """Kept for API compatibility; device updates are handled via update_btle_device."""
+        pass
